@@ -1,101 +1,73 @@
-import { Room, GameState } from '../types/game';
-import { createInitialGameState } from '../utils/gameLogic';
+import { Room, GameState, RoomStatus } from "../types/game";
+import { createInitialGameState } from "../utils/gameLogic";
 
-export class GameRoomManager {
-  private rooms: Map<string, Room> = new Map();
+export class GameRoom implements Room {
+	id: string;
+	name: string;
+	players: string[] = [];
+	maxPlayers: number = 2;
+	status: RoomStatus = "waiting";
+	gameState: GameState;
 
-  createRoom(roomName: string, creatorSocketId: string): Room {
-    const roomId = `room_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-    
-    const newRoom: Room = {
-      id: roomId,
-      name: roomName,
-      players: [creatorSocketId],
-      maxPlayers: 2,
-      status: 'waiting',
-      gameState: createInitialGameState()
-    };
+	constructor(id: string, name: string, creatorId: string) {
+		this.id = id;
+		this.name = name;
+		this.gameState = createInitialGameState();
+		this.addPlayer(creatorId);
+	}
 
-    this.rooms.set(roomId, newRoom);
-    console.log(` Sala creada: ${roomName} (${roomId})`);
-    return newRoom;
-  }
+	addPlayer(playerId: string): void {
+		if (this.isFull()) {
+			throw new Error("Room is full.");
+		}
+		if (!this.players.includes(playerId)) {
+			this.players.push(playerId);
+		}
+	}
 
-    joinRoom(roomId: string, socketId: string): Room | null {
-    const room = this.rooms.get(roomId);
-    
-    if (!room) {
-        console.log(` Sala ${roomId} no encontrada`);
-        return null;
-    }
+	removePlayer(playerId: string): number {
+		this.players = this.players.filter((id) => id !== playerId);
 
-    if (room.players.length >= room.maxPlayers) {
-        console.log(` Sala ${roomId} llena. Jugadores: ${room.players.length}`);
-        return null;
-    }
+		if (this.players.length < 2 && this.status === "playing") {
+			// If a player leaves mid-game, reset the room state
+			this.status = "waiting";
+			this.gameState = createInitialGameState();
+		}
 
-    console.log(` Uniendo usuario probando ${socketId} a sala ${room.name}`);
-    room.players.push(socketId);
-    room.status = room.players.length >= room.maxPlayers ? 'full' : 'waiting';
+		return this.players.length;
+	}
 
-    if (room.players.length === room.maxPlayers) {
-        console.log(` Sala ${room.name} COMPLETA - Iniciando juego`);
-        room.gameState.status = 'playing';
-        room.status = 'playing';
-    }
+	isFull(): boolean {
+		return this.players.length >= this.maxPlayers;
+	}
 
-    this.rooms.set(roomId, room);
-    console.log(` Usuario ${socketId} unido a ${room.name}. Total: ${room.players.length}`);
-    return room;
-    }
+	startGame(): void {
+		if (this.isFull() && this.status !== "playing") {
+			this.status = "playing";
+			this.gameState.status = "playing";
+			// The first player to join is always 'X'
+			this.gameState.currentPlayer = "X";
+		}
+	}
 
-  leaveRoom(socketId: string): string | null {
-    for (const [roomId, room] of this.rooms.entries()) {
-      if (room.players.includes(socketId)) {
-        room.players = room.players.filter(id => id !== socketId);
-        
-        if (room.players.length === 0) {
-          this.rooms.delete(roomId);
-          console.log(` Sala eliminada: ${room.name} (${roomId})`);
-        } else {
-          room.gameState = createInitialGameState();
-          room.status = 'waiting';
-          this.rooms.set(roomId, room);
-          console.log(` Usuario ${socketId} salió de ${room.name}`);
-        }
-        
-        return roomId;
-      }
-    }
-    return null;
-  }
+	updateGameState(newGameState: GameState): void {
+		this.gameState = newGameState;
+		if (newGameState.status === "finished") {
+			this.status = "finished";
+		}
+	}
 
-  getRoom(roomId: string): Room | undefined {
-    return this.rooms.get(roomId);
-  }
-
-  getAllRooms(): Room[] {
-    return Array.from(this.rooms.values());
-  }
-
-  updateGameState(roomId: string, gameState: GameState): void {
-    const room = this.rooms.get(roomId);
-    if (room) {
-      room.gameState = gameState;
-      this.rooms.set(roomId, room);
-    }
-  }
-
-  cleanupEmptyRooms(): void {
-    let cleanedCount = 0;
-    for (const [roomId, room] of this.rooms.entries()) {
-      if (room.players.length === 0) {
-        this.rooms.delete(roomId);
-        cleanedCount++;
-      }
-    }
-    if (cleanedCount > 0) {
-      console.log(` Limpieza: ${cleanedCount} salas vacías eliminadas`);
-    }
-  }
+	/**
+	 * Returns a plain object representation of the room, suitable for sending over the wire.
+	 */
+	toJSON(): Room {
+		return {
+			id: this.id,
+			name: this.name,
+			players: this.players,
+			maxPlayers: this.maxPlayers,
+			status: this.status,
+			gameState: this.gameState,
+		};
+	}
 }
