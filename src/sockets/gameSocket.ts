@@ -1,181 +1,157 @@
-import { Server, Socket } from 'socket.io';
-import { ClientToServerEvents, ServerToClientEvents, GameStatus } from '../types/game';
-import { GameRoomManager } from '../models/GameRoom';
-import { checkWinner, isBoardFull } from '../utils/gameLogic';
+import { Worker } from "worker_threads";
+import { Server, Socket } from "socket.io";
+import {
+	ClientToServerEvents,
+	ServerToClientEvents,
+	Room,
+} from "../types/game";
+import { randomUUID } from "crypto";
+
+// Maps to keep track of workers and room metadata
+const roomWorkers = new Map<string, Worker>();
+const roomData = new Map<string, Room>();
+const socketToRoom = new Map<string, string>();
 
 export class GameSocketHandler {
-  private roomManager: GameRoomManager;
+	initialize(io: Server<ClientToServerEvents, ServerToClientEvents>) {
+		io.on("connection", (socket: Socket) => {
+			console.log(" Nuevo cliente conectado:", socket.id);
 
-  constructor() {
-    this.roomManager = new GameRoomManager();
-    
-    // Limpieza periódica de salas vacías
-    setInterval(() => {
-      this.roomManager.cleanupEmptyRooms();
-    }, 60000);
-  }
+			socket.emit("rooms-updated", Array.from(roomData.values()));
 
-  initialize(io: Server<ClientToServerEvents, ServerToClientEvents>) {
-    io.on('connection', (socket: Socket) => {
-      console.log(' Nuevo cliente conectado:', socket.id);
+			socket.on("create-room", (roomName: string) => {
+				const roomId = randomUUID();
+				const worker = new Worker("./src/workers/game.worker.ts", {
+					execArgv: ["-r", "ts-node/register"],
+					workerData: {
+						roomId,
+						roomName,
+						creatorId: socket.id,
+					},
+				});
 
-      // Enviar lista inicial de salas
-      socket.emit('rooms-updated', this.roomManager.getAllRooms());
+				roomWorkers.set(roomId, worker);
+				socketToRoom.set(socket.id, roomId);
 
-      // Crear sala
-        socket.on('create-room', (roomName: string) => {
-        try {
-            console.log(` Usuario ${socket.id} creando sala: ${roomName}`);
-            const room = this.roomManager.createRoom(roomName, socket.id);
-            
-            socket.join(room.id);
-            
-            io.emit('rooms-updated', this.roomManager.getAllRooms());
-            
-            socket.emit('room-joined', { 
-            ...room, 
-            playerSymbol: 'X' // Primer jugador siempre es X
-            });
-            
-            console.log(` Sala creada y creador unido: ${roomName}`);
-        } catch (error) {
-            console.error('Error al crear sala:', error);
-            socket.emit('error', 'Error al crear la sala');
-        }
-        });
+				worker.on("message", (message) => {
+					const { type, payload } = message;
+					switch (type) {
+						case "room-created":
+							roomData.set(roomId, payload);
+							socket.join(roomId);
+							socket.emit("room-joined", { ...payload, playerSymbol: "X" });
+							io.emit("rooms-updated", Array.from(roomData.values()));
+							break;
 
-      // Unirse a sala
-    socket.on('join-room', (roomId: string) => {
-    try {
-        console.log(` Usuario ${socket.id} intentando unirse a sala: ${roomId}`);
-        const room = this.roomManager.joinRoom(roomId, socket.id);
-        
-        if (!room) {
-        socket.emit('error', 'Sala no encontrada o llena');
-        return;
-        }
+						case "player-joined":
+							roomData.set(roomId, payload);
+							io.emit("rooms-updated", Array.from(roomData.values()));
+							break;
 
-        socket.join(roomId);
-        io.emit('rooms-updated', this.roomManager.getAllRooms());
+						case "game-started":
+							io.to(roomId).emit("game-started", payload);
+							break;
 
-        const playerSymbol = room.players[0] === socket.id ? 'X' : 'O';
-        socket.emit('room-joined', { ...room, playerSymbol });
+						case "state-update":
+							io.to(roomId).emit("opponent-moved", payload);
+							break;
 
-        // Notificar a los otros jugadores de la sala
-        socket.to(roomId).emit('player-joined', room.players.length);
+						case "game-over":
+							setTimeout(() => io.to(roomId).emit("game-over", payload), 1000);
+							break;
 
-        console.log(` Usuario ${socket.id} unido a ${room.name}. Jugadores: ${room.players.length}/${room.maxPlayers}`);
+						case "player-left":
+							if (payload.isEmpty) {
+								worker.terminate();
+								roomWorkers.delete(roomId);
+								roomData.delete(roomId);
+							} else {
+								socket.to(roomId).emit("player-left");
+							}
+							io.emit("rooms-updated", Array.from(roomData.values()));
+							break;
 
-        // INICIAR JUEGO SI HAY 2 JUGADORES - CORREGIDO
-        if (room.players.length === room.maxPlayers && room.status === 'playing') {
-        console.log(` Iniciando juego en sala: ${room.name}`);
-        
-        // Enviar game-started a AMBOS jugadores
-        io.to(roomId).emit('game-started', {
-            ...room.gameState,
-            playerSymbol: room.players[0] === socket.id ? 'X' : 'O'
-        });
-        
-        console.log(` Evento game-started enviado a sala ${roomId}`);
-        }
-    } catch (error) {
-        console.error('Error al unirse a sala:', error);
-        socket.emit('error', 'Error al unirse a la sala');
-    }
-    });
+						case "error":
+							// Find the specific socket to send the error to, if available
+							const targetSocket = io.sockets.sockets.get(payload.playerId);
+							if (targetSocket) {
+								targetSocket.emit("error", payload.message);
+							} else {
+								// Fallback to room broadcast if specific player socket not found
+								io.to(roomId).emit("error", payload.message);
+							}
+							break;
+					}
+				});
 
-      // Hacer movimiento
-      socket.on('make-move', (data: { position: number }) => {
-        try {
-          const rooms = this.roomManager.getAllRooms();
-          const playerRoom = rooms.find(room => 
-            room.players.includes(socket.id) && room.status === 'playing'
-          );
+				worker.on("error", (err) => {
+					console.error(`Worker error in room ${roomId}:`, err);
+					io.to(roomId).emit(
+						"error",
+						"A critical error occurred in the game room."
+					);
+				});
 
-          if (!playerRoom) {
-            socket.emit('error', 'No estás en una sala de juego activa');
-            return;
-          }
+				worker.on("exit", (code) => {
+					if (code !== 0) {
+						console.error(
+							`Worker for room ${roomId} stopped with exit code ${code}`
+						);
+					}
+				});
+			});
 
-          const gameState = playerRoom.gameState;
-          
-          // Validar movimiento
-          if (gameState.board[data.position] || gameState.status !== 'playing') {
-            socket.emit('error', 'Movimiento inválido');
-            return;
-          }
+			// Unirse a sala
+			socket.on("join-room", (roomId: string) => {
+				const worker = roomWorkers.get(roomId);
+				const room = roomData.get(roomId);
 
-          // Determinar símbolo del jugador
-          const playerSymbol = playerRoom.players[0] === socket.id ? 'X' : 'O';
-          if (gameState.currentPlayer !== playerSymbol) {
-            socket.emit('error', 'No es tu turno');
-            return;
-          }
+				if (!worker || !room) {
+					return socket.emit("error", "Room not found or is full.");
+				}
 
-          // Aplicar movimiento
-          const newBoard = [...gameState.board];
-          newBoard[data.position] = playerSymbol;
+				socket.join(roomId);
+				socketToRoom.set(socket.id, roomId);
 
-          // Verificar ganador
-          const { winner, line } = checkWinner(newBoard);
-          let newStatus: GameStatus = gameState.status;
-          let newWinner = gameState.winner;
+				// The creator is 'X', the joiner is 'O'
+				socket.emit("room-joined", { ...room, playerSymbol: "O" });
 
-          if (winner) {
-            newStatus = 'finished';
-            newWinner = winner;
-          } else if (isBoardFull(newBoard)) {
-            newStatus = 'finished';
-            newWinner = 'draw';
-          }
+				worker.postMessage({ type: "join", payload: { playerId: socket.id } });
+			});
 
-          // Actualizar estado
-          const newGameState = {
-            board: newBoard,
-            currentPlayer: newStatus === 'playing' ? (playerSymbol === 'X' ? 'O' : 'X') : gameState.currentPlayer,
-            status: newStatus,
-            winner: newWinner,
-            winningLine: line
-          };
+			// Hacer movimiento
+			socket.on("make-move", (data: { position: number }) => {
+				const roomId = socketToRoom.get(socket.id);
+				if (roomId) {
+					const worker = roomWorkers.get(roomId);
+					worker?.postMessage({
+						type: "make-move",
+						payload: { playerId: socket.id, position: data.position },
+					});
+				}
+			});
 
-          this.roomManager.updateGameState(playerRoom.id, newGameState);
+			const handleLeave = () => {
+				const roomId = socketToRoom.get(socket.id);
+				if (roomId) {
+					const worker = roomWorkers.get(roomId);
+					worker?.postMessage({
+						type: "leave",
+						payload: { playerId: socket.id },
+					});
+					socket.leave(roomId);
+					socketToRoom.delete(socket.id);
+				}
+			};
 
-          // Notificar a ambos jugadores
-          io.to(playerRoom.id).emit('opponent-moved', newGameState);
+			// Salir de sala
+			socket.on("leave-room", handleLeave);
 
-          // Si el juego terminó
-          if (newStatus === 'finished') {
-            setTimeout(() => {
-              io.to(playerRoom.id).emit('game-over', {
-                winner: newWinner,
-                winningLine: line
-              });
-            }, 1000);
-          }
-        } catch (error) {
-          socket.emit('error', 'Error al procesar el movimiento');
-        }
-      });
-
-      // Salir de sala
-      socket.on('leave-room', () => {
-        const roomId = this.roomManager.leaveRoom(socket.id);
-        if (roomId) {
-          socket.leave(roomId);
-          socket.to(roomId).emit('player-left', this.roomManager.getRoom(roomId)?.players.length || 0);
-          io.emit('rooms-updated', this.roomManager.getAllRooms());
-        }
-      });
-
-      // Desconexión
-      socket.on('disconnect', () => {
-        console.log('🔌 Cliente desconectado:', socket.id);
-        const roomId = this.roomManager.leaveRoom(socket.id);
-        if (roomId) {
-          socket.to(roomId).emit('player-left', this.roomManager.getRoom(roomId)?.players.length || 0);
-          io.emit('rooms-updated', this.roomManager.getAllRooms());
-        }
-      });
-    });
-  }
+			// Desconexión
+			socket.on("disconnect", () => {
+				console.log("🔌 Cliente desconectado:", socket.id);
+				handleLeave();
+			});
+		});
+	}
 }
